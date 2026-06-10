@@ -352,6 +352,12 @@ if __name__ == "__main__":
         required=False,
         default=f"{HOME_DIR}/duck_config.json",
     )
+    parser.add_argument(
+        "--serial_port",
+        type=str,
+        default="/dev/ttyACM0",
+        help="Motor controller serial port",
+    )
     parser.add_argument("-a", "--action_scale", type=float, default=0.25)
     parser.add_argument("-p", type=int, default=30)
     parser.add_argument("-i", type=int, default=0)
@@ -387,6 +393,7 @@ if __name__ == "__main__":
     rl_walk = RLWalk(
         args.onnx_model_path,
         duck_config_path=args.duck_config_path,
+        serial_port=args.serial_port,
         action_scale=args.action_scale,
         pid=pid,
         control_freq=args.control_freq,
