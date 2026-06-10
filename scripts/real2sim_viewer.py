@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import socket
+import threading
 import time
 from pathlib import Path
 
@@ -18,6 +19,8 @@ DEFAULT_XML_PATH = (
     / "xmls"
     / "open_duck_mini_v2.xml"
 )
+
+DEFAULT_OFFSETS_PATH = Path("real2sim_offsets.json")
 
 
 def make_joint_qpos_addrs(model):
@@ -99,6 +102,150 @@ def set_home_keyframe(model, data, keyframe_name):
         mujoco.mj_forward(model, data)
 
 
+def load_offsets(path, joint_names):
+    offsets = {name: 0.0 for name in joint_names}
+    if path is None:
+        return offsets
+
+    path = Path(path).expanduser()
+    if not path.exists():
+        return offsets
+
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    values = data.get("joints_offsets", data)
+    for name in joint_names:
+        if name in values:
+            offsets[name] = float(values[name])
+    return offsets
+
+
+def save_offsets(path, offsets, joint_names):
+    path = Path(path).expanduser()
+    payload = {
+        "joints_offsets": {
+            name: float(offsets.get(name, 0.0))
+            for name in joint_names
+        }
+    }
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=4)
+        f.write("\n")
+
+
+def start_tuner_gui(offsets, latest_values, joint_names, lock, save_path):
+    import tkinter as tk
+    from tkinter import ttk
+
+    def run():
+        root = tk.Tk()
+        root.title("Real2Sim Offset Tuner")
+        root.geometry("420x230")
+
+        selected_joint = tk.StringVar(value=joint_names[0])
+        step_value = tk.StringVar(value="0.01")
+        offset_value = tk.StringVar()
+        raw_value = tk.StringVar()
+        model_value = tk.StringVar()
+        status_value = tk.StringVar(value="Use raw joint streaming on the robot.")
+
+        def get_step():
+            try:
+                return float(step_value.get())
+            except ValueError:
+                status_value.set("Invalid step value")
+                return 0.0
+
+        def adjust(sign):
+            joint = selected_joint.get()
+            step = get_step()
+            with lock:
+                offsets[joint] = float(offsets.get(joint, 0.0)) + sign * step
+            refresh()
+
+        def zero_selected():
+            joint = selected_joint.get()
+            with lock:
+                offsets[joint] = 0.0
+            refresh()
+
+        def print_offsets():
+            with lock:
+                print(json.dumps({"joints_offsets": offsets}, indent=4))
+
+        def save():
+            with lock:
+                save_offsets(save_path, offsets, joint_names)
+            status_value.set(f"Saved {save_path}")
+
+        def refresh():
+            joint = selected_joint.get()
+            with lock:
+                offset = offsets.get(joint, 0.0)
+                raw = latest_values["raw"].get(joint)
+                model = latest_values["model"].get(joint)
+
+            offset_value.set(f"{offset:+.6f} rad")
+            raw_value.set("---" if raw is None else f"{raw:+.6f} rad")
+            model_value.set("---" if model is None else f"{model:+.6f} rad")
+            root.after(100, refresh)
+
+        main_frame = ttk.Frame(root, padding=12)
+        main_frame.grid(row=0, column=0, sticky="nsew")
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
+
+        ttk.Label(main_frame, text="Joint").grid(row=0, column=0, sticky="w")
+        joint_box = ttk.Combobox(
+            main_frame,
+            textvariable=selected_joint,
+            values=joint_names,
+            state="readonly",
+            width=28,
+        )
+        joint_box.grid(row=0, column=1, columnspan=3, sticky="ew", padx=6, pady=4)
+
+        ttk.Label(main_frame, text="Offset").grid(row=1, column=0, sticky="w")
+        ttk.Label(main_frame, textvariable=offset_value).grid(row=1, column=1, sticky="w")
+        ttk.Label(main_frame, text="Raw").grid(row=2, column=0, sticky="w")
+        ttk.Label(main_frame, textvariable=raw_value).grid(row=2, column=1, sticky="w")
+        ttk.Label(main_frame, text="Model").grid(row=3, column=0, sticky="w")
+        ttk.Label(main_frame, textvariable=model_value).grid(row=3, column=1, sticky="w")
+
+        ttk.Label(main_frame, text="Step").grid(row=4, column=0, sticky="w")
+        ttk.Entry(main_frame, textvariable=step_value, width=10).grid(
+            row=4, column=1, sticky="w", padx=6, pady=4
+        )
+
+        ttk.Button(main_frame, text="-", command=lambda: adjust(-1.0)).grid(
+            row=5, column=0, sticky="ew", padx=3, pady=6
+        )
+        ttk.Button(main_frame, text="+", command=lambda: adjust(1.0)).grid(
+            row=5, column=1, sticky="ew", padx=3, pady=6
+        )
+        ttk.Button(main_frame, text="Zero", command=zero_selected).grid(
+            row=5, column=2, sticky="ew", padx=3, pady=6
+        )
+        ttk.Button(main_frame, text="Print", command=print_offsets).grid(
+            row=6, column=0, sticky="ew", padx=3
+        )
+        ttk.Button(main_frame, text="Save", command=save).grid(
+            row=6, column=1, sticky="ew", padx=3
+        )
+
+        ttk.Label(main_frame, textvariable=status_value).grid(
+            row=7, column=0, columnspan=4, sticky="w", pady=(12, 0)
+        )
+
+        main_frame.columnconfigure(1, weight=1)
+        refresh()
+        root.mainloop()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--xml_path", default=str(DEFAULT_XML_PATH))
@@ -124,6 +271,26 @@ def main():
         default=-1.0,
         help="Set to 1 if the base appears upside down with the default value",
     )
+    parser.add_argument(
+        "--offsets_path",
+        default=None,
+        help="JSON file containing joints_offsets, used when raw positions are received",
+    )
+    parser.add_argument(
+        "--duck_config_path",
+        default=None,
+        help="duck_config.json to use as initial offset values",
+    )
+    parser.add_argument(
+        "--save_offsets_path",
+        default=str(DEFAULT_OFFSETS_PATH),
+        help="Where the tuner saves adjusted joints_offsets",
+    )
+    parser.add_argument(
+        "--tuner_gui",
+        action="store_true",
+        help="Open a small Tkinter GUI for live offset tuning",
+    )
     args = parser.parse_args()
 
     xml_path = Path(args.xml_path).expanduser().resolve()
@@ -132,6 +299,22 @@ def main():
     set_home_keyframe(model, data, args.keyframe)
 
     joint_qpos_addrs = make_joint_qpos_addrs(model)
+    joint_names = list(joint_qpos_addrs.keys())
+    initial_offsets_path = args.offsets_path or args.duck_config_path
+    offsets = load_offsets(initial_offsets_path, joint_names)
+    latest_values = {
+        "raw": {},
+        "model": {},
+    }
+    values_lock = threading.Lock()
+    if args.tuner_gui:
+        start_tuner_gui(
+            offsets,
+            latest_values,
+            joint_names,
+            values_lock,
+            Path(args.save_offsets_path),
+        )
     free_joint_qpos_addr = find_free_joint_qpos_addr(model)
     home_base_quat = None
     if free_joint_qpos_addr is not None:
@@ -161,12 +344,21 @@ def main():
                     joints = payload.get("joints", {})
 
                     missing = []
+                    raw_packet = bool(payload.get("raw", False))
                     for name, angle in joints.items():
                         qpos_addr = joint_qpos_addrs.get(name)
                         if qpos_addr is None:
                             missing.append(name)
                             continue
-                        data.qpos[qpos_addr] = float(angle)
+                        raw_angle = float(angle)
+                        with values_lock:
+                            offset = offsets.get(name, 0.0)
+                        model_angle = raw_angle - offset if raw_packet else raw_angle
+                        data.qpos[qpos_addr] = model_angle
+                        with values_lock:
+                            if raw_packet:
+                                latest_values["raw"][name] = raw_angle
+                            latest_values["model"][name] = model_angle
 
                     if args.use_imu and free_joint_qpos_addr is not None:
                         imu = payload.get("imu")
