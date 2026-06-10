@@ -1,11 +1,13 @@
 import argparse
 import json
+import math
 import socket
 import time
 from pathlib import Path
 
 import mujoco
 import mujoco.viewer
+import numpy as np
 
 
 DEFAULT_XML_PATH = (
@@ -27,6 +29,61 @@ def make_joint_qpos_addrs(model):
         if model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_HINGE:
             addrs[name] = int(model.jnt_qposadr[joint_id])
     return addrs
+
+
+def find_free_joint_qpos_addr(model):
+    for joint_id in range(model.njnt):
+        if model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_FREE:
+            return int(model.jnt_qposadr[joint_id])
+    return None
+
+
+def quat_multiply(q1, q2):
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        dtype=float,
+    )
+
+
+def quat_from_euler(roll, pitch, yaw):
+    cr = math.cos(roll * 0.5)
+    sr = math.sin(roll * 0.5)
+    cp = math.cos(pitch * 0.5)
+    sp = math.sin(pitch * 0.5)
+    cy = math.cos(yaw * 0.5)
+    sy = math.sin(yaw * 0.5)
+
+    return np.array(
+        [
+            cr * cp * cy + sr * sp * sy,
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+        ],
+        dtype=float,
+    )
+
+
+def quat_from_accel(accelero, roll_sign=1.0, pitch_sign=1.0):
+    ax, ay, az = accelero
+    norm = math.sqrt(ax * ax + ay * ay + az * az)
+    if norm < 1e-6:
+        return None
+
+    ax /= norm
+    ay /= norm
+    az /= norm
+
+    roll = math.atan2(ay, az) * roll_sign
+    pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az)) * pitch_sign
+    return quat_from_euler(roll, pitch, 0.0)
 
 
 def set_home_keyframe(model, data, keyframe_name):
@@ -54,6 +111,13 @@ def main():
         default=2.0,
         help="Seconds before reporting that no packets are arriving",
     )
+    parser.add_argument(
+        "--use_imu",
+        action="store_true",
+        help="Apply IMU accelerometer roll/pitch to the MuJoCo floating base",
+    )
+    parser.add_argument("--roll_sign", type=float, default=1.0)
+    parser.add_argument("--pitch_sign", type=float, default=1.0)
     args = parser.parse_args()
 
     xml_path = Path(args.xml_path).expanduser().resolve()
@@ -62,6 +126,13 @@ def main():
     set_home_keyframe(model, data, args.keyframe)
 
     joint_qpos_addrs = make_joint_qpos_addrs(model)
+    free_joint_qpos_addr = find_free_joint_qpos_addr(model)
+    home_base_quat = None
+    if free_joint_qpos_addr is not None:
+        home_base_quat = np.array(
+            data.qpos[free_joint_qpos_addr + 3 : free_joint_qpos_addr + 7],
+            dtype=float,
+        )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.listen_ip, args.port))
@@ -90,6 +161,28 @@ def main():
                             missing.append(name)
                             continue
                         data.qpos[qpos_addr] = float(angle)
+
+                    if args.use_imu and free_joint_qpos_addr is not None:
+                        imu = payload.get("imu")
+                        if imu is not None:
+                            accelero = imu.get("accelero")
+                            if accelero is not None:
+                                tilt_quat = quat_from_accel(
+                                    accelero,
+                                    roll_sign=args.roll_sign,
+                                    pitch_sign=args.pitch_sign,
+                                )
+                                if tilt_quat is not None:
+                                    base_quat = quat_multiply(
+                                        home_base_quat,
+                                        tilt_quat,
+                                    )
+                                    base_quat /= np.linalg.norm(base_quat)
+                                    data.qpos[
+                                        free_joint_qpos_addr
+                                        + 3 : free_joint_qpos_addr
+                                        + 7
+                                    ] = base_quat
 
                     mujoco.mj_forward(model, data)
                     last_packet_t = time.time()

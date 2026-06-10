@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mini_bdx_runtime"))
 
 from mini_bdx_runtime.duck_config import DuckConfig
+from mini_bdx_runtime.raw_imu import Imu
 from mini_bdx_runtime.rustypot_position_hwi import HWI
 
 
@@ -64,10 +65,21 @@ def main():
         action="store_true",
         help="Stream raw servo positions instead of offset-corrected model angles",
     )
+    parser.add_argument(
+        "--include_imu",
+        action="store_true",
+        help="Include IMU gyro and accelerometer data in the UDP payload",
+    )
     args = parser.parse_args()
 
     duck_config = DuckConfig(config_json_path=args.duck_config_path)
     hwi = HWI(duck_config, usb_port=args.serial_port)
+    imu = None
+    if args.include_imu:
+        imu = Imu(
+            sampling_freq=int(args.freq),
+            upside_down=duck_config.imu_upside_down,
+        )
     joint_names = list(hwi.joints.keys())
     joint_ids = list(hwi.joints.values())
 
@@ -105,6 +117,12 @@ def main():
                 "raw": args.raw,
                 "joints": joints,
             }
+            if imu is not None:
+                imu_data = imu.get_data()
+                payload["imu"] = {
+                    "gyro": [float(value) for value in imu_data["gyro"]],
+                    "accelero": [float(value) for value in imu_data["accelero"]],
+                }
 
             sock.sendto(json.dumps(payload).encode("utf-8"), target)
             elapsed = time.time() - start
