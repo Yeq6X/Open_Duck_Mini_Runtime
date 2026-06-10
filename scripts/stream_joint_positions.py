@@ -15,6 +15,38 @@ from mini_bdx_runtime.rustypot_position_hwi import HWI
 HOME_DIR = os.path.expanduser("~")
 
 
+def read_joint_positions(hwi, joint_names, joint_ids, raw, last_positions):
+    try:
+        positions = hwi.io.read_present_position(joint_ids)
+        if not raw:
+            positions = [
+                position - hwi.joints_offsets[name]
+                for name, position in zip(joint_names, positions)
+            ]
+        return {
+            name: float(position)
+            for name, position in zip(joint_names, positions)
+        }
+    except Exception as e:
+        print(f"batch read failed, falling back to individual reads: {e}")
+
+    positions = {}
+    for name, joint_id in zip(joint_names, joint_ids):
+        try:
+            position = hwi.io.read_present_position([joint_id])[0]
+            if not raw:
+                position -= hwi.joints_offsets[name]
+            positions[name] = float(position)
+            last_positions[name] = float(position)
+        except Exception as e:
+            if name in last_positions:
+                positions[name] = last_positions[name]
+            else:
+                print(f"read failed for {name} / ID {joint_id}: {e}")
+
+    return positions
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target_ip", required=True, help="Receiver PC IP address")
@@ -50,26 +82,28 @@ def main():
 
     mode = "raw servo positions" if args.raw else "offset-corrected model angles"
     print(f"Streaming {mode} to {args.target_ip}:{args.port} at {args.freq:g} Hz")
+    last_positions = {}
 
     try:
         while True:
             start = time.time()
 
-            if args.raw:
-                positions = hwi.io.read_present_position(joint_ids)
-            else:
-                positions = hwi.get_present_positions()
-                if positions is None:
-                    time.sleep(period)
-                    continue
+            joints = read_joint_positions(
+                hwi,
+                joint_names,
+                joint_ids,
+                args.raw,
+                last_positions,
+            )
+
+            if not joints:
+                time.sleep(period)
+                continue
 
             payload = {
                 "timestamp": start,
                 "raw": args.raw,
-                "joints": {
-                    name: float(position)
-                    for name, position in zip(joint_names, positions)
-                },
+                "joints": joints,
             }
 
             sock.sendto(json.dumps(payload).encode("utf-8"), target)
