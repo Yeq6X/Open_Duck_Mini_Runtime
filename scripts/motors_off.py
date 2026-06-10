@@ -1,5 +1,9 @@
 import argparse
 import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mini_bdx_runtime"))
 
 from mini_bdx_runtime.duck_config import DuckConfig
 from mini_bdx_runtime.rustypot_position_hwi import HWI
