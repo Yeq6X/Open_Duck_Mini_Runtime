@@ -71,8 +71,8 @@ def quat_from_euler(roll, pitch, yaw):
     )
 
 
-def quat_from_accel(accelero, roll_sign=1.0, pitch_sign=1.0):
-    ax, ay, az = accelero
+def quat_from_accel(accelero, accel_sign=-1.0, roll_sign=1.0, pitch_sign=1.0):
+    ax, ay, az = [value * accel_sign for value in accelero]
     norm = math.sqrt(ax * ax + ay * ay + az * az)
     if norm < 1e-6:
         return None
@@ -118,6 +118,12 @@ def main():
     )
     parser.add_argument("--roll_sign", type=float, default=1.0)
     parser.add_argument("--pitch_sign", type=float, default=1.0)
+    parser.add_argument(
+        "--accel_sign",
+        type=float,
+        default=-1.0,
+        help="Set to 1 if the base appears upside down with the default value",
+    )
     args = parser.parse_args()
 
     xml_path = Path(args.xml_path).expanduser().resolve()
@@ -169,6 +175,7 @@ def main():
                             if accelero is not None:
                                 tilt_quat = quat_from_accel(
                                     accelero,
+                                    accel_sign=args.accel_sign,
                                     roll_sign=args.roll_sign,
                                     pitch_sign=args.pitch_sign,
                                 )
